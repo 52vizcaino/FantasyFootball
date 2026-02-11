@@ -64,14 +64,38 @@ run_projection_accuracy <- function(season_year) {
     relocate(full_name, team, position, .after = player_id)
   
   # Scrape and clean projections
-  proj_raw <- scrape_data(
+  non_yahoo_proj <- scrape_data(
     season = season_year,
     week = 0,
-    src = c("FantasyPros", "CBS", "NFL", "ESPN", "Yahoo"),
+    src = c("FantasyPros", "CBS", "NFL", "ESPN"),
     pos = c("QB", "RB", "WR", "TE")
   )
-  
-  proj_all <- bind_rows(proj_raw, .id = "proj_position")
+
+  yahoo_weekly_all <- map_dfr(
+    1:18,
+    ~ scrape_data(
+      season = season_year,
+      week = .x,
+      src = "Yahoo",
+      pos = c("QB", "RB", "WR", "TE")
+    ) %>%
+      bind_rows(.id = "proj_position") %>%
+      mutate(week = .x)
+  )
+
+  yahoo_yearly <- yahoo_weekly_all %>%
+    mutate(across(where(is.character), ~ na_if(.x, ""))) %>%
+    group_by(player, pos, data_src, proj_position) %>%
+    summarize(
+      across(where(is.numeric) & !any_of("week"), ~ sum(.x, na.rm = TRUE)),
+      team = dplyr::first(team[!is.na(team)], default = NA_character_),
+      .groups = "drop"
+    )
+
+  proj_all <- bind_rows(
+    bind_rows(non_yahoo_proj, .id = "proj_position"),
+    yahoo_yearly
+  )
   
   proj_clean <- proj_all %>%
     # Use internal position column (e.g., 'pos') or proj_position
