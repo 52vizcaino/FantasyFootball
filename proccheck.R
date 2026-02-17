@@ -559,6 +559,10 @@ readr::write_csv(source_accuracy, paste0(out_prefix, "source_accuracy_", season_
   )
 }
 
+run_projection_accuracy(2022)
+run_projection_accuracy(2023)
+run_projection_accuracy(2024)
+
 # Example:
 # source("proccheck_noCBS.R") 
 # res <- run_projection_accuracy(2024)
