@@ -75,6 +75,32 @@ run_projection_accuracy <- function(
 
   roster_skill <- roster_all %>% dplyr::filter(position %in% pos)
 
+  # Build a unique mapping from PFR id -> GSIS id to avoid many-to-many joins when
+  # mapping snap counts (which are keyed by PFR ids in some seasons).
+  roster_pfr_map <- roster_all %>%
+    dplyr::select(player_id, pfr_id) %>%
+    dplyr::filter(!is.na(pfr_id) & pfr_id != "", !is.na(player_id) & player_id != "") %>%
+    dplyr::distinct(pfr_id, player_id)
+
+  # In the rare case a PFR id maps to multiple GSIS ids, keep the first to avoid duplication.
+  dup_pfr <- roster_pfr_map %>%
+    dplyr::count(pfr_id, name = "n_ids") %>%
+    dplyr::filter(n_ids > 1)
+
+  if (nrow(dup_pfr) > 0) {
+    message(sprintf(
+      "ℹ️ Detected %s PFR ids mapping to multiple GSIS ids in rosters; keeping first to avoid many-to-many joins.",
+      nrow(dup_pfr)
+    ))
+    roster_pfr_map <- roster_pfr_map %>%
+      dplyr::group_by(pfr_id) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup()
+  } else {
+    roster_pfr_map <- roster_pfr_map %>% dplyr::distinct(pfr_id, .keep_all = TRUE)
+  }
+
+
   # ----------------------------
   # Helper: safe scrape wrapper
   # ----------------------------
@@ -170,11 +196,11 @@ run_projection_accuracy <- function(
     } else if ("pfr_player_id" %in% names(snap_counts)) {
       snaps_mapped <- snap_counts %>%
         dplyr::mutate(pfr_id = as.character(pfr_player_id)) %>%
-        dplyr::left_join(roster_all %>% dplyr::select(player_id, pfr_id), by = "pfr_id")
+        dplyr::left_join(roster_pfr_map, by = "pfr_id")
     } else if ("pfr_id" %in% names(snap_counts)) {
       snaps_mapped <- snap_counts %>%
         dplyr::mutate(pfr_id = as.character(pfr_id)) %>%
-        dplyr::left_join(roster_all %>% dplyr::select(player_id, pfr_id), by = "pfr_id")
+        dplyr::left_join(roster_pfr_map, by = "pfr_id")
     } else {
       message("ℹ️ Snap counts table missing an identifiable player id column. Using PBP opportunity-based games_played.")
       return(pbp_games %>%
@@ -340,6 +366,53 @@ run_projection_accuracy <- function(
   if (!"src_id" %in% names(proj_all)) proj_all$src_id <- NA
 
   # ----------------------------
+  # Standardize projection column names + safely parse numerics
+  #
+  # Some sources (notably ESPN QB tables in certain seasons) may return slightly different
+  # column names or formatted numbers. This block coalesces common aliases into the
+  # standard ffanalytics-style column names and uses parse_number() so values like
+  # "4,500" do not become NA.
+  # ----------------------------
+  coalesce_cols <- function(df, target, candidates) {
+    if (!target %in% names(df)) df[[target]] <- NA
+    for (cand in candidates) {
+      if (cand %in% names(df)) {
+        df[[target]] <- dplyr::coalesce(df[[target]], df[[cand]])
+      }
+    }
+    df
+  }
+
+  proj_all <- proj_all %>%
+    { coalesce_cols(., "pass_att", c("pass_attempts", "passing_attempts")) } %>%
+    { coalesce_cols(., "pass_comp", c("pass_completions", "passing_completions")) } %>%
+    { coalesce_cols(., "pass_yds", c("pass_yards", "passing_yards", "pass_yd", "passyds", "PassYds", "PASS_YDS")) } %>%
+    { coalesce_cols(., "pass_tds", c("pass_td", "pass_tds_proj", "passing_tds", "PassTD", "PASS_TDS")) } %>%
+    { coalesce_cols(., "pass_int", c("pass_ints", "ints", "interceptions_proj", "interceptions")) } %>%
+    { coalesce_cols(., "rush_att", c("rush_attempts", "rushing_attempts", "carries", "carry")) } %>%
+    { coalesce_cols(., "rush_yds", c("rush_yards", "rushing_yards", "rush_yd", "rushyds")) } %>%
+    { coalesce_cols(., "rush_tds", c("rush_td", "rushing_tds")) } %>%
+    { coalesce_cols(., "rec_tgt",  c("targets")) } %>%
+    { coalesce_cols(., "rec_yds",  c("receiving_yards", "rec_yards", "rec_yd")) } %>%
+    { coalesce_cols(., "rec_tds",  c("receiving_tds", "rec_td")) } %>%
+    { coalesce_cols(., "rec",      c("receptions")) } %>%
+    { coalesce_cols(., "fumbles_lost", c("fumbleslost", "fum_lost")) }
+
+  proj_numeric_cols <- intersect(
+    c(
+      "pass_att", "pass_comp", "pass_yds", "pass_tds", "pass_int",
+      "rush_att", "rush_yds", "rush_tds",
+      "rec_tgt", "rec_yds", "rec_tds", "rec",
+      "fumbles_lost"
+    ),
+    names(proj_all)
+  )
+
+  proj_all <- proj_all %>%
+    dplyr::mutate(dplyr::across(dplyr::all_of(proj_numeric_cols), ~ readr::parse_number(as.character(.x))))
+
+
+  # ----------------------------
   # Crosswalk: map to gsis_id using MFL id first, then per-site src_id
   # ----------------------------
   ff_ids <- nflreadr::load_ff_playerids() %>%
@@ -413,10 +486,48 @@ run_projection_accuracy <- function(
     dplyr::summarize(
       full_name = dplyr::first(full_name),
       team      = dplyr::first(team),
-      dplyr::across(dplyr::all_of(proj_stat_cols), ~ mean(suppressWarnings(as.numeric(.x)), na.rm = TRUE)),
+      dplyr::across(dplyr::all_of(proj_stat_cols), ~ mean(.x, na.rm = TRUE)),
       .groups = "drop"
     ) %>%
     dplyr::mutate(dplyr::across(dplyr::all_of(proj_stat_cols), ~ ifelse(is.nan(.x), NA_real_, .x)))
+
+
+  # ----------------------------
+  # Projection availability diagnostics (helps catch source/position parsing issues)
+  # ----------------------------
+  if (all(c("data_src","position") %in% names(proj_dedup))) {
+    diag_non_na <- proj_dedup %>%
+      dplyr::group_by(data_src, position) %>%
+      dplyr::summarize(
+        n_rows = dplyr::n(),
+        n_pass_yds = if ("pass_yds" %in% names(proj_dedup)) sum(!is.na(pass_yds)) else 0L,
+        n_pass_tds = if ("pass_tds" %in% names(proj_dedup)) sum(!is.na(pass_tds)) else 0L,
+        n_rush_yds = if ("rush_yds" %in% names(proj_dedup)) sum(!is.na(rush_yds)) else 0L,
+        n_rec_yds  = if ("rec_yds"  %in% names(proj_dedup)) sum(!is.na(rec_yds))  else 0L,
+        .groups = "drop"
+      ) %>%
+      dplyr::arrange(data_src, position)
+
+    message("\n--- Projection non-NA diagnostics (by source/position) ---")
+    print(diag_non_na)
+
+    readr::write_csv(diag_non_na, paste0(out_prefix, "projection_non_na_diag_", season_year, ".csv"))
+  }
+
+  # If ESPN QBs are present but have no passing yards, export raw ESPN QB scrape rows for inspection
+  if ("ESPN" %in% src) {
+    espn_qb <- proj_dedup %>% dplyr::filter(data_src == "ESPN", position == "QB")
+    if (nrow(espn_qb) > 0 && ("pass_yds" %in% names(espn_qb)) && sum(!is.na(espn_qb$pass_yds)) == 0) {
+      message(sprintf(
+        "⚠️ ESPN QB passing projections are all NA for %s. Writing proj_debug_ESPN_QB_%s.csv so you can inspect raw columns/values.",
+        season_year, season_year
+      ))
+      # best-effort: export the mapped rows before dedupe to preserve original columns
+      dbg <- proj_mapped %>% dplyr::filter(data_src == "ESPN", position == "QB")
+      readr::write_csv(dbg, paste0(out_prefix, "proj_debug_ESPN_QB_", season_year, ".csv"))
+    }
+  }
+
 
   # ----------------------------
   # Join projections to actual stats, then apply injury filter
@@ -559,11 +670,7 @@ readr::write_csv(source_accuracy, paste0(out_prefix, "source_accuracy_", season_
   )
 }
 
-run_projection_accuracy(2022)
-run_projection_accuracy(2023)
-run_projection_accuracy(2024)
-
 # Example:
-# source("proccheck_noCBS.R") 
+# source("proccheck_noCBS.R")
 # res <- run_projection_accuracy(2024)
 # res$source_accuracy
